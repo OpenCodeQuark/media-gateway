@@ -1,0 +1,26 @@
+{
+  "name": "gd2link",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rjrajujha/gd2link.git"
+  },
+  "author": "Raju Jha",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/rjrajujha/gd2link/issues"
+  },
+  "homepage": "https://github.com/rjrajujha/gd2link#readme",
+  "dependencies": {
+    "axios": "^1.10.0",
+    "crypto": "^1.0.1",
+    "express": "^5.1.0"
+  }
+}
