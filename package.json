@@ -1,0 +1,38 @@
+{
+  "name": "media-gateway",
+  "version": "0.2.0",
+  "description": "Stream Google Drive media over HTTP with Range support",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "NODE_ENV=test node --test --test-concurrency=1 'tests/**/*.test.js'",
+    "audit:prod": "npm audit --omit=dev"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OpenCodeQuark/media-gateway.git"
+  },
+  "author": "Raju Jha",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/OpenCodeQuark/media-gateway/issues"
+  },
+  "homepage": "https://github.com/OpenCodeQuark/media-gateway#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "pino": "^9.6.0",
+    "pino-http": "^10.4.0"
+  },
+  "devDependencies": {
+    "pino-pretty": "^13.0.0",
+    "supertest": "^7.0.0"
+  }
+}

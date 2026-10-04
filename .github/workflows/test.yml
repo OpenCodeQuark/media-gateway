@@ -1,0 +1,45 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Production dependency audit
+        run: npm run audit:prod
+
+      - name: Smoke start
+        run: |
+          NODE_ENV=production LOG_LEVEL=silent PORT=5012 node index.js &
+          pid=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5012/health >/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+          curl -sf http://127.0.0.1:5012/health | grep -q '"status":"ok"'
+          curl -sf http://127.0.0.1:5012/ready | grep -q '"status":"ready"'
+          curl -sf http://127.0.0.1:5012/metrics | grep -q '"success":true'
+          kill "$pid"
+          wait "$pid" || true
