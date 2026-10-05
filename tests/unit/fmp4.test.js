@@ -157,6 +157,24 @@ describe('fragmented mp4 index', () => {
     assert.equal(base, first + index.sidxLen);
   });
 
+  it('does not classify a cold non-zero seek before serving it', async () => {
+    clearFragmentedMp4Cache();
+    const { file, first } = fragmentedFile();
+    const upstream = sliceFetcher(file);
+
+    const seekAt = first + 8;
+    const opened = await openFragmentedMp4(
+      'cold-seek',
+      { rawRangeHeader: `bytes=${seekAt}-${seekAt + 7}` },
+      upstream.fetch,
+    );
+
+    assert.equal(opened, null);
+    // The cold seek is intentionally handed to the normal upstream Range path.
+    // fMP4 classification is only paid once a start-at-zero playback path exists.
+    assert.deepEqual(upstream.calls, []);
+  });
+
   it('serves a seekable virtual file and reuses the cached head', async () => {
     clearFragmentedMp4Cache();
     const { file, first } = fragmentedFile();
