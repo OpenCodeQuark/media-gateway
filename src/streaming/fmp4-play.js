@@ -492,14 +492,11 @@ export async function openFragmentedMp4(fileId, options, fetchUpstream) {
   if (known?.index) return serveIndexed(fileId, known.index, options, fetchUpstream);
 
   if (!isPlayFromStart(options)) {
-    let pending = inflight.get(fileId);
-    if (!pending) {
-      pending = classify(fileId, fetchUpstream, options.signal).finally(() => inflight.delete(fileId));
-      inflight.set(fileId, pending);
-    }
-    const index = await pending;
-    if (!index) return null;
-    return serveIndexed(fileId, index, options, fetchUpstream);
+    // A cold non-zero Range is already a random-access request. Do not spend
+    // two extra Drive round trips building the fMP4 index before serving it.
+    // Once the index exists, the cached path above still maps virtual offsets
+    // to the nearest moof for fast, seekable playback.
+    return null;
   }
 
   if (inflight.has(fileId)) {
