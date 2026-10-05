@@ -1,3 +1,5 @@
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import helmet from 'helmet';
 import { pinoHttp } from 'pino-http';
@@ -7,6 +9,7 @@ import { rateLimitMiddleware } from './middleware/rate-limit.js';
 import { requestIdMiddleware } from './middleware/request-id.js';
 import { rejectWhenShuttingDown } from './middleware/shutdown.js';
 import healthRoutes from './routes/health.js';
+import homeRoutes from './routes/home.js';
 import mediaRoutes from './routes/media.js';
 import { logger } from './utils/logger.js';
 
@@ -15,6 +18,10 @@ export function createApp() {
 
   if (config.trustProxy) app.set('trust proxy', 1);
   app.disable('x-powered-by');
+  app.set('view engine', 'ejs');
+  app.set('views', join(dirname(fileURLToPath(import.meta.url)), 'views'));
+  // Never compress media responses (would break Range / progressive playback).
+  app.set('etag', false);
 
   app.use(requestIdMiddleware);
   app.use(
@@ -31,7 +38,8 @@ export function createApp() {
       logger,
       genReqId: (req) => String(req.headers['x-request-id'] ?? ''),
       autoLogging: {
-        ignore: (req) => req.url === '/health' || req.url === '/ready',
+        ignore: (req) =>
+          req.url === '/health' || req.url === '/ready' || req.url === '/' || req.url?.startsWith('/?'),
       },
       serializers: {
         req: (req) => ({ id: req.id, method: req.method, url: req.url }),
@@ -46,6 +54,7 @@ export function createApp() {
   });
 
   app.use(rateLimitMiddleware);
+  app.use(homeRoutes);
   app.use(healthRoutes);
   app.use('/media', mediaRoutes);
 

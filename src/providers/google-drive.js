@@ -1,6 +1,8 @@
 import { PassThrough } from 'node:stream';
 import { config } from '../config.js';
-import { formatContentRange } from '../streaming/range.js';
+import { openFragmentedMp4 } from '../streaming/fmp4-play.js';
+import { getPlaybackSession, hasPlaybackSession, openPlaybackSlice } from '../streaming/play-start.js';
+import { formatContentRange, parseRangeHeader } from '../streaming/range.js';
 import { readUpstreamText, upstreamFetch } from '../streaming/upstream.js';
 import { AppError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
@@ -11,6 +13,30 @@ const DRIVE_FILE_ID = /^[a-zA-Z0-9_-]{10,128}$/;
 const DRIVE_HOSTS = new Set(['drive.google.com', 'docs.google.com']);
 
 let cachedTokens = null;
+
+/** Confirmed media download URLs (post virus-scan). Avoids repeating the interstitial on every Range request. */
+const confirmedDownloads = new Map();
+const CONFIRM_CACHE_TTL_MS = 15 * 60 * 1000;
+
+function getCachedDownloadUrl(fileId) {
+  const entry = confirmedDownloads.get(fileId);
+  if (!entry) return undefined;
+  if (entry.expiresAt <= Date.now()) {
+    confirmedDownloads.delete(fileId);
+    return undefined;
+  }
+  return entry.url;
+}
+
+function cacheDownloadUrl(fileId, url) {
+  if (!fileId || !url) return;
+  confirmedDownloads.set(fileId, { url, expiresAt: Date.now() + CONFIRM_CACHE_TTL_MS });
+}
+
+/** Test helper */
+export function clearConfirmedDownloadCache() {
+  confirmedDownloads.clear();
+}
 
 /** Extract and normalize a Google Drive file ID. Rejects arbitrary URLs (SSRF). */
 export function parseGoogleDriveId(input) {
@@ -125,6 +151,8 @@ function buildDownloadUrl(fileId) {
   const url = new URL('https://drive.usercontent.google.com/download');
   url.searchParams.set('id', fileId);
   url.searchParams.set('export', 'download');
+  // Skip the virus-scan HTML interstitial when Drive accepts a direct confirm.
+  url.searchParams.set('confirm', 't');
   return url.toString();
 }
 
@@ -189,30 +217,52 @@ async function fetchDriveMetadata(fileId, signal) {
   return JSON.parse(await readUpstreamText(response));
 }
 
-async function fetchConfirmed(fileId, confirm, headers, signal, useAlt) {
+function buildConfirmedUrl(fileId, confirm, useAlt) {
   const url = new URL(useAlt ? buildAltDownloadUrl(fileId) : buildDownloadUrl(fileId));
   url.searchParams.set('confirm', confirm.confirm);
   if (confirm.uuid) url.searchParams.set('uuid', confirm.uuid);
-  return upstreamFetch(url, { headers, signal, redirect: 'follow' });
+  return url.toString();
+}
+
+function isHtmlResponse(response) {
+  const contentType = response.headers.get('content-type') ?? '';
+  return contentType.includes('text/html');
+}
+
+function rememberMediaUrl(fileId, response) {
+  if (response.status < 400 && response.url && !isHtmlResponse(response)) {
+    cacheDownloadUrl(fileId, response.url);
+  }
+}
+
+async function fetchConfirmed(fileId, confirm, headers, signal, useAlt) {
+  const confirmedUrl = buildConfirmedUrl(fileId, confirm, useAlt);
+  const response = await upstreamFetch(confirmedUrl, { headers, signal });
+  if (response.status < 400 && !isHtmlResponse(response)) {
+    cacheDownloadUrl(fileId, confirmedUrl);
+  }
+  return response;
 }
 
 async function downloadWithConfirm(fileId, headers, signal) {
-  let response = await upstreamFetch(buildDownloadUrl(fileId), {
-    headers,
-    signal,
-    redirect: 'follow',
-  });
+  // Reuse post-confirm URL so Chromium's many Range requests skip the virus-scan HTML each time.
+  const cachedUrl = getCachedDownloadUrl(fileId);
+  if (cachedUrl) {
+    const cachedResponse = await upstreamFetch(cachedUrl, { headers, signal });
+    if (cachedResponse.status < 400 && !isHtmlResponse(cachedResponse)) {
+      return cachedResponse;
+    }
+    cachedResponse.abort();
+    confirmedDownloads.delete(fileId);
+  }
 
-  const contentType = response.headers.get('content-type') ?? '';
-  if (response.status === 200 && contentType.includes('text/html') && response.body) {
+  let response = await upstreamFetch(buildDownloadUrl(fileId), { headers, signal });
+
+  if (response.status === 200 && isHtmlResponse(response) && response.body) {
     const html = await readUpstreamText(response);
     const confirm = extractConfirmParams(html);
     if (!confirm) {
-      response = await upstreamFetch(buildAltDownloadUrl(fileId), {
-        headers,
-        signal,
-        redirect: 'follow',
-      });
+      response = await upstreamFetch(buildAltDownloadUrl(fileId), { headers, signal });
       const altType = response.headers.get('content-type') ?? '';
       if (response.status === 200 && altType.includes('text/html') && response.body) {
         const altConfirm = extractConfirmParams(await readUpstreamText(response));
@@ -224,11 +274,13 @@ async function downloadWithConfirm(fileId, headers, signal) {
         }
         return fetchConfirmed(fileId, altConfirm, headers, signal, true);
       }
+      rememberMediaUrl(fileId, response);
       return response;
     }
     return fetchConfirmed(fileId, confirm, headers, signal, false);
   }
 
+  rememberMediaUrl(fileId, response);
   return response;
 }
 
@@ -243,11 +295,7 @@ async function openDriveDownload({ fileId, rangeHeader, signal }) {
     apiUrl.searchParams.set('alt', 'media');
     apiUrl.searchParams.set('supportsAllDrives', 'true');
 
-    const apiResponse = await upstreamFetch(apiUrl, {
-      headers,
-      signal,
-      redirect: 'follow',
-    });
+    const apiResponse = await upstreamFetch(apiUrl, { headers, signal });
 
     if (apiResponse.status !== 401 && apiResponse.status !== 403) {
       return apiResponse;
@@ -364,6 +412,106 @@ function wrapUpstreamStream(response) {
   return { stream: pass, abort };
 }
 
+async function openStructured(fileId, rangeHeader, signal) {
+  const response = await openDriveDownload({ fileId, rangeHeader, signal });
+  if (response.status === 416) {
+    response.abort();
+    throw new AppError('RANGE_NOT_SATISFIABLE', 'Range not satisfiable.');
+  }
+  if (response.status >= 400) {
+    response.abort();
+    throw mapDriveStatusToError(response.status);
+  }
+
+  const contentRange = response.headers.get('content-range');
+  const totalFromRange = Number(contentRange?.match(/\/(\d+)\s*$/)?.[1]);
+  const contentLength = Number(response.headers.get('content-length'));
+  const total =
+    Number.isFinite(totalFromRange) && totalFromRange > 0
+      ? totalFromRange
+      : Number.isFinite(contentLength)
+        ? contentLength
+        : 0;
+  const name = nameFromDisposition(response.headers.get('content-disposition'));
+  const { stream, abort } = wrapUpstreamStream(response);
+  return {
+    stream,
+    abort,
+    total,
+    contentType: sanitizeMimeType(response.headers.get('content-type'), name),
+    name,
+    etag: response.headers.get('etag') ?? undefined,
+  };
+}
+
+/** Byte span for a client request. Suffix and multi-ranges are fetched directly. */
+function startupSpan(options) {
+  if (options.range) {
+    const { start, end } = options.range;
+    return { start, end, full: false };
+  }
+  if (!options.rawRangeHeader) return { start: 0, end: null, full: true };
+  let parsed;
+  try {
+    parsed = parseRangeHeader(options.rawRangeHeader);
+  } catch {
+    return null;
+  }
+  if (!parsed || parsed.isSuffix || parsed.start === undefined) return null;
+  return { start: parsed.start, end: parsed.end ?? null, full: false };
+}
+
+async function maybeFastStart(fileId, options) {
+  const fragmented = await openFragmentedMp4(fileId, options, (rangeHeader, signal) =>
+    openStructured(fileId, rangeHeader, signal),
+  );
+  if (fragmented) return fragmented;
+
+  const span = startupSpan(options);
+  if (!span) return null;
+
+  const existing = hasPlaybackSession(fileId);
+  // Only the first start-at-0 request opens the shared download. Later ranges
+  // (Chromium seeking to the first sample) read that same download.
+  if (!existing && span.start !== 0) return null;
+
+  const session = getPlaybackSession(fileId, (rangeHeader, signal) =>
+    openStructured(fileId, rangeHeader, signal),
+  );
+  const slice = await openPlaybackSlice(session, { start: span.start, end: span.end });
+  if (!slice) return null;
+
+  const start = span.start;
+  const end = start + slice.contentLength - 1;
+  const metadata = {
+    id: fileId,
+    provider: 'google-drive',
+    name: session.name,
+    mimeType: session.contentType,
+    size: slice.total,
+    etag: session.etag,
+    cacheable: true,
+  };
+
+  const ranged = Boolean(options.range || options.rawRangeHeader);
+
+  return {
+    stream: slice.stream,
+    metadata,
+    statusCode: ranged ? 206 : 200,
+    contentLength: slice.contentLength,
+    contentRange: ranged
+      ? formatContentRange({ start, end, length: slice.contentLength, total: slice.total })
+      : undefined,
+    headers: {
+      'Content-Type': session.contentType,
+      'Accept-Ranges': 'bytes',
+      'Cache-Control': config.mediaCacheControl,
+    },
+    abort: slice.abort,
+  };
+}
+
 export const googleDriveProvider = {
   name: 'google-drive',
 
@@ -417,16 +565,53 @@ export const googleDriveProvider = {
 
   async openStream(id, options = {}) {
     const fileId = parseGoogleDriveId(id);
-    const metadata = options.metadata ?? (await this.getMetadata(fileId, options.signal));
-    const rangeHeader = options.range
-      ? `bytes=${options.range.start}-${options.range.end}`
-      : undefined;
+    const rangeHeader =
+      options.rawRangeHeader ||
+      (options.range ? `bytes=${options.range.start}-${options.range.end}` : undefined);
+
+    const fast = await maybeFastStart(fileId, options);
+    if (fast) return fast;
+
+    let metadata = options.metadata;
+    if (!metadata && !options.rawRangeHeader) {
+      metadata = await this.getMetadata(fileId, options.signal);
+    }
 
     const response = await openDriveDownload({
       fileId,
       rangeHeader,
       signal: options.signal,
     });
+
+    const contentRangeHeader = response.headers.get('content-range');
+    const totalFromRange = Number(contentRangeHeader?.match(/\/(\d+)\s*$/)?.[1]);
+    const upstreamLength = Number(response.headers.get('content-length'));
+    const contentType = sanitizeMimeType(
+      response.headers.get('content-type') ?? metadata?.mimeType,
+      metadata?.name || nameFromDisposition(response.headers.get('content-disposition')),
+    );
+
+    if (!metadata) {
+      const size =
+        Number.isFinite(totalFromRange) && totalFromRange > 0
+          ? totalFromRange
+          : response.status === 200 && Number.isFinite(upstreamLength)
+            ? upstreamLength
+            : NaN;
+      if (!Number.isFinite(size)) {
+        response.abort();
+        throw new AppError('UPSTREAM_ERROR', 'Unable to determine media size from Google Drive.');
+      }
+      metadata = {
+        id: fileId,
+        provider: this.name,
+        name: nameFromDisposition(response.headers.get('content-disposition')),
+        mimeType: contentType,
+        size,
+        etag: response.headers.get('etag') ?? undefined,
+        cacheable: true,
+      };
+    }
 
     if (response.status === 416) {
       response.abort();
@@ -440,8 +625,9 @@ export const googleDriveProvider = {
       throw mapDriveStatusToError(response.status);
     }
 
+    const wantsPartial = Boolean(rangeHeader);
     // Refuse to buffer whole files when upstream ignores Range on large media.
-    if (options.range && response.status === 200) {
+    if (wantsPartial && response.status === 200) {
       const acceptRanges = response.headers.get('accept-ranges');
       if (acceptRanges?.toLowerCase() === 'none') {
         response.abort();
@@ -450,8 +636,15 @@ export const googleDriveProvider = {
           'Upstream does not support byte ranges for this media.',
         );
       }
-      const cl = Number(response.headers.get('content-length') ?? NaN);
-      if (Number.isFinite(cl) && cl === metadata.size && metadata.size > options.range.length) {
+      const expected =
+        options.range?.length ??
+        (Number.isFinite(upstreamLength) ? upstreamLength : Number.NaN);
+      if (
+        Number.isFinite(upstreamLength) &&
+        upstreamLength === metadata.size &&
+        Number.isFinite(expected) &&
+        metadata.size > expected
+      ) {
         response.abort();
         throw new AppError(
           'UPSTREAM_ERROR',
@@ -461,22 +654,29 @@ export const googleDriveProvider = {
     }
 
     const { stream, abort } = wrapUpstreamStream(response);
-    const contentType = sanitizeMimeType(
-      response.headers.get('content-type') ?? metadata.mimeType,
-      metadata.name,
-    );
 
     let statusCode = response.status === 206 ? 206 : 200;
     let contentLength;
     let contentRange;
 
-    if (options.range) {
+    if (wantsPartial) {
       statusCode = 206;
-      contentLength = options.range.length;
-      contentRange = response.headers.get('content-range') ?? formatContentRange(options.range);
+      contentRange =
+        contentRangeHeader ||
+        (options.range ? formatContentRange(options.range) : undefined);
+      contentLength = Number.isFinite(upstreamLength)
+        ? upstreamLength
+        : options.range?.length;
+      if (!Number.isFinite(contentLength)) {
+        abort();
+        throw new AppError('UPSTREAM_ERROR', 'Upstream range response missing Content-Length.');
+      }
+      if (!contentRange) {
+        abort();
+        throw new AppError('UPSTREAM_ERROR', 'Upstream range response missing Content-Range.');
+      }
     } else {
-      const cl = Number(response.headers.get('content-length') ?? metadata.size);
-      contentLength = Number.isFinite(cl) ? cl : metadata.size;
+      contentLength = Number.isFinite(upstreamLength) ? upstreamLength : metadata.size;
     }
 
     const headers = {

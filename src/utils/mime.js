@@ -44,6 +44,13 @@ export function sanitizeMimeType(raw, fallbackName) {
   return candidate;
 }
 
+export function isSupportedMedia(mimeType) {
+  return (
+    typeof mimeType === 'string' &&
+    (mimeType.startsWith('image/') || mimeType.startsWith('video/') || mimeType.startsWith('audio/'))
+  );
+}
+
 export function contentDispositionFor(mimeType, filename) {
   const inline =
     INLINE_TYPES.has(mimeType) || INLINE_PREFIXES.some((p) => mimeType.startsWith(p));

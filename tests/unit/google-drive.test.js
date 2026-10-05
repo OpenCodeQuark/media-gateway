@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  clearConfirmedDownloadCache,
   extractConfirmParams,
   parseGoogleDriveId,
 } from '../../src/providers/google-drive.js';
@@ -8,6 +9,7 @@ import { assertAllowedUpstreamUrl } from '../../src/streaming/upstream.js';
 import { AppError } from '../../src/utils/errors.js';
 
 describe('google drive parsing and SSRF guards', () => {
+  clearConfirmedDownloadCache();
   it('parses raw IDs and share URLs', () => {
     assert.equal(parseGoogleDriveId('1AbCdEfGhIjKlMnOpQrStUv'), '1AbCdEfGhIjKlMnOpQrStUv');
     assert.equal(

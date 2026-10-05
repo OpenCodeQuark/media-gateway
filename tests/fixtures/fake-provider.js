@@ -1,5 +1,5 @@
 import { Readable } from 'node:stream';
-import { formatContentRange } from '../../src/streaming/range.js';
+import { formatContentRange, resolveByteRange } from '../../src/streaming/range.js';
 import { AppError } from '../../src/utils/errors.js';
 
 export class FakeMediaProvider {
@@ -37,17 +37,22 @@ export class FakeMediaProvider {
     if (!file) throw new AppError('MEDIA_NOT_FOUND', 'Media could not be found.');
     if (file.failUpstream) throw new AppError('UPSTREAM_ERROR', 'Upstream failed.');
 
-    const start = options.range?.start ?? 0;
-    const end = options.range?.end ?? metadata.size - 1;
+    let range = options.range;
+    if (!range && options.rawRangeHeader) {
+      range = resolveByteRange(options.rawRangeHeader, metadata.size);
+    }
+
+    const start = range?.start ?? 0;
+    const end = range?.end ?? metadata.size - 1;
     const slice = file.data.subarray(start, end + 1);
     const stream = Readable.from(slice);
 
     return {
       stream,
       metadata,
-      statusCode: options.range ? 206 : 200,
+      statusCode: range ? 206 : 200,
       contentLength: slice.length,
-      contentRange: options.range ? formatContentRange(options.range) : undefined,
+      contentRange: range ? formatContentRange(range) : undefined,
       headers: {
         'Content-Type': metadata.mimeType,
         'Accept-Ranges': 'bytes',

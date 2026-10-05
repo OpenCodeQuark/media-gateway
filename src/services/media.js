@@ -10,7 +10,7 @@ import {
 import { createClientAbortSignal, pipeWithBackpressure } from '../streaming/pipe.js';
 import { AppError, isAppError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
-import { contentDispositionFor } from '../utils/mime.js';
+import { contentDispositionFor, isSupportedMedia } from '../utils/mime.js';
 
 let provider = googleDriveProvider;
 let activeStreams = 0;
@@ -40,9 +40,13 @@ function setCommonHeaders(res, metadata) {
   }
 }
 
+function cacheKeyFor(mediaId) {
+  return `${provider.name}:${mediaId}`;
+}
+
 async function getMetadata(mediaId, signal) {
   const id = provider.resolveId(mediaId);
-  const cacheKey = `${provider.name}:${id}`;
+  const cacheKey = cacheKeyFor(id);
 
   const cached = metadataCache.get(cacheKey);
   if (cached) {
@@ -52,6 +56,11 @@ async function getMetadata(mediaId, signal) {
 
   metrics.inc('metadata_cache_misses');
   return metadataCache.getOrLoad(cacheKey, () => provider.getMetadata(id, signal));
+}
+
+/** Metadata-only helper for homepage validation (no media body). */
+export async function getMetadataForInput(input, signal) {
+  return getMetadata(input, signal);
 }
 
 export async function handleMediaRequest(req, res) {
@@ -80,22 +89,21 @@ export async function handleMediaRequest(req, res) {
   shutdownSignal?.addEventListener('abort', onShutdownAbort);
 
   try {
-    const metadata = await getMetadata(mediaId, signal);
-
-    let range;
-    try {
-      range = resolveByteRange(req.headers.range, metadata.size);
-    } catch (error) {
-      if (isAppError(error) && error.code === 'RANGE_NOT_SATISFIABLE') {
-        res.setHeader('Content-Range', formatUnsatisfiedContentRange(metadata.size));
-        res.setHeader('Accept-Ranges', 'bytes');
-      }
-      throw error;
-    }
-
-    if (range) metrics.inc('range_requests');
-
     if (req.method === 'HEAD') {
+      const metadata = await getMetadata(mediaId, signal);
+      let range;
+      try {
+        range = resolveByteRange(req.headers.range, metadata.size);
+      } catch (error) {
+        if (isAppError(error) && error.code === 'RANGE_NOT_SATISFIABLE') {
+          res.setHeader('Content-Range', formatUnsatisfiedContentRange(metadata.size));
+          res.setHeader('Accept-Ranges', 'bytes');
+        }
+        throw error;
+      }
+      if (!isSupportedMedia(metadata.mimeType)) {
+        throw new AppError('UNSUPPORTED_MEDIA', 'This file type is not supported.');
+      }
       setCommonHeaders(res, metadata);
       if (range) {
         res.status(206);
@@ -109,17 +117,49 @@ export async function handleMediaRequest(req, res) {
       return;
     }
 
-    const result = await provider.openStream(mediaId, { range, signal, metadata });
+    // GET streams immediately. Do not probe metadata or warm head/tail first —
+    // that extra Drive round-trip is what kept Chromium from starting playback.
+    const cached = metadataCache.get(cacheKeyFor(mediaId));
+    if (cached) metrics.inc('metadata_cache_hits');
+
+    let range;
+    if (cached) {
+      try {
+        range = resolveByteRange(req.headers.range, cached.size);
+      } catch (error) {
+        if (isAppError(error) && error.code === 'RANGE_NOT_SATISFIABLE') {
+          res.setHeader('Content-Range', formatUnsatisfiedContentRange(cached.size));
+          res.setHeader('Accept-Ranges', 'bytes');
+        }
+        throw error;
+      }
+    }
+    if (range || req.headers.range) metrics.inc('range_requests');
+
+    const result = await provider.openStream(mediaId, {
+      range: cached ? range : undefined,
+      rawRangeHeader: cached ? undefined : req.headers.range,
+      signal,
+      metadata: cached,
+    });
     upstreamAbort = result.abort;
+    metadataCache.set(cacheKeyFor(mediaId), result.metadata);
+
+    if (!isSupportedMedia(result.metadata.mimeType)) {
+      throw new AppError('UNSUPPORTED_MEDIA', 'This file type is not supported.');
+    }
 
     setCommonHeaders(res, result.metadata);
     for (const [key, value] of Object.entries(result.headers)) {
-      if (!res.getHeader(key)) res.setHeader(key, value);
+      if (!res.getHeader(key) || key === 'Accept-Ranges') res.setHeader(key, value);
     }
 
     res.status(result.statusCode);
     res.setHeader('Content-Length', String(result.contentLength));
     if (result.contentRange) res.setHeader('Content-Range', result.contentRange);
+    if (typeof res.flushHeaders === 'function') {
+      res.flushHeaders();
+    }
 
     activeStreams += 1;
     metrics.inc('media_streams_active');
@@ -148,6 +188,16 @@ export async function handleMediaRequest(req, res) {
     }
   } catch (error) {
     upstreamAbort?.();
+
+    if (
+      isAppError(error) &&
+      error.code === 'RANGE_NOT_SATISFIABLE' &&
+      !res.headersSent &&
+      Number.isFinite(error.details?.total)
+    ) {
+      res.setHeader('Content-Range', formatUnsatisfiedContentRange(error.details.total));
+      res.setHeader('Accept-Ranges', 'bytes');
+    }
 
     if (signal.aborted) {
       if (res.headersSent) res.destroy();

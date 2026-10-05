@@ -2,14 +2,16 @@ import { Router } from 'express';
 import { metrics } from '../metrics.js';
 import { isShuttingDown } from '../middleware/shutdown.js';
 import { getActiveStreams } from '../services/media.js';
+import pkg from '../../package.json' with { type: 'json' };
 
 const router = Router();
 
 router.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'ok',
+    version: pkg.version,
     timestamp: new Date().toISOString(),
-    service: 'media-gateway'
+    service: 'media-gateway',
   });
 });
 

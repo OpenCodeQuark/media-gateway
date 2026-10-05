@@ -31,11 +31,18 @@ See `.env.example`. Public/shared Drive files work without credentials. Optional
 npm start
 ```
 
+## Homepage
+
+Open `/` for a small UI that turns a Drive link/ID into a direct `/media/{id}` URL for the current host.
+
 ## API
 
 ```text
+GET  /
 GET  /media/:id
 HEAD /media/:id
+GET  /api/resolve?input=
+GET  /api/validate?input=
 GET  /health
 GET  /ready
 GET  /metrics

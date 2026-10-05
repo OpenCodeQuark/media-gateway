@@ -39,7 +39,8 @@ export const config = {
   rateLimitWindowMs: intEnv('RATE_LIMIT_WINDOW_MS', 60_000, { min: 1 }),
   rateLimitMax: intEnv('RATE_LIMIT_MAX', 120, { min: 1 }),
   maxConcurrentStreams: intEnv('MAX_CONCURRENT_STREAMS', 100, { min: 0 }),
-  mediaCacheControl: strEnv('MEDIA_CACHE_CONTROL', 'public, max-age=3600'),
+  // no-transform discourages proxies from compressing media and breaking Range.
+  mediaCacheControl: strEnv('MEDIA_CACHE_CONTROL', 'public, max-age=3600, no-transform'),
   metadataCacheTtlMs: intEnv('METADATA_CACHE_TTL_MS', 300_000, { min: 1 }),
   metadataCacheMaxEntries: intEnv('METADATA_CACHE_MAX_ENTRIES', 1000, { min: 1 }),
   upstreamConnectTimeoutMs: intEnv('UPSTREAM_CONNECT_TIMEOUT_MS', 10_000, { min: 1 }),
